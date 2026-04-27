@@ -46,10 +46,6 @@ and is the source of truth for the diagram structure. Edit either:
   gen_block_excalidraw.py`) for structural changes — adding a new
   component, repositioning a layer, recolouring a cluster.
 
-A secondary [`block.dot`](block.dot) (Graphviz) file is also kept for
-quick text-only inspection; the Excalidraw output is the one used in
-documentation.
-
 Layered top-to-bottom:
 
 1. **PDP-8 Omnibus card edge (J1)** — 144 PCB-edge contacts, ~96 active

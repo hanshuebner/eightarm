@@ -19,7 +19,12 @@ microcontroller in the PGA2350 module form-factor. The Omnibus side uses
 the bus's negative-true 0/+3 V signaling and the RP2350's 3.3 V CMOS GPIO.
 Octal latches between the buffers and the RP2350 let the MD bus and the
 DATA bus share a single 12-bit RP2350 GPIO port. Slow signals are absorbed
-by four MCP23017 I²C port expanders.
+by two MCP23017 I²C port expanders (console set-and-hold and
+on-board housekeeping); a 4× 74HC597 shift-register chain plus a
+74HC273 pulse-latch bank captures the remaining slow signals
+(including short pulses like TPx, INT_STROBE, LINK_LOAD and the
+end-of-cycle phase signals INHIBIT and RETURN) at full bus rate
+for cycle-accurate trace (§6.10).
 
 The host PC sees a single USB device exposing several CDC ACM endpoints.
 One endpoint is the control/console port; the remaining endpoints are
@@ -62,7 +67,7 @@ Layered top-to-bottom:
 5. **USB-C → host PC** — composite CDC: CDC0 console, CDC1..N virtual
    TTYs.
 
-To the right of the RP2350 sit the I²C subsystem (4× MCP23017 + up to
+To the right of the RP2350 sit the I²C subsystem (2× MCP23017 + up to
 4× SC16IS740 UART, all on I²C0 at 1 MHz fast-mode-plus) and the
 optional per-port-modular RS-232 add-on (1–4× MAX3232 + DB9).
 
@@ -79,8 +84,21 @@ Mandatory population (memory + IOT + USB console):
 * 4× 74AHC574 octal edge-triggered latches — MD-in, DATA-in, MD-out,
   DATA-out bus sharing
 * 1× 74AHC574 — IOT response latch (SKIP, C0, C1, C2 plus 4 spare)
-* 4× MCP23017 16-bit I²C GPIO expanders at I²C addresses 0x20..0x23 —
-  64 pins of slow-signal I/O, roughly half spare for expansion
+* 4× 74HC597 octal parallel-load shift registers (dual-stage:
+  separate storage register and shift register) — slow-signal trace
+  chain, storage clocked at TS1-rising, shifted by PIO during
+  TS2..TS4 (§6.10)
+* 1× 74HC273 octal D-FF with /CLR — pulse-latch bank for short
+  pulse and phase signals (TP1..4, INT_STROBE, LINK_LOAD, INHIBIT,
+  RETURN); accumulates pulses during a cycle, sampled into the trace
+  chain at end-of-cycle, reset by a brief RC-differentiated pulse off
+  TS1 (§6.10)
+* 2× MCP23017 16-bit I²C GPIO expanders at I²C addresses 0x22..0x23 —
+  bidirectional console-mode outputs (§4.4) and on-board housekeeping
+  (status LEDs, reset button, board-ID straps, indicator drives).
+  The two former observe-only expanders at 0x20/0x21 are removed:
+  the slow signals they covered are now captured at full bus rate by
+  the §6.10 trace chain.
 * Omnibus 144-pin edge connector
 * +3.3 V LDO regulator (e.g. AMS1117-3.3 or MIC5219-3.3)
 * Pull-up/-down networks on slow signals
@@ -309,17 +327,48 @@ response latch (§5).
 
 The following signals are routed directly to RP2350 GPIO pins, with
 appropriate level-translation through the existing 74244 / 74540 buffers.
-"Fast" here means "must be valid within tens of nanoseconds of an Omnibus
-edge".
+
+A signal is classified **fast** if the card must observe or drive it
+within a single Omnibus cycle (~1.5 µs) to participate correctly —
+typically meaning it carries cycle-by-cycle data (MA, MD, DATA, TS
+edges) or gates a response that must be valid by a specific timing
+pulse (SKIP/Cx by TP2, INT_RQST deassertion within the acknowledging
+IOT cycle). End-to-end latency from bus edge to firmware-visible value
+is ~10–20 ns through the 74244 input buffer plus one PIO clock at
+150 MHz.
+
+A signal is classified **slow** (§4.2) if the card only needs it at
+human-perceivable rates and is bidirectional or output-only — namely,
+the set-and-hold console-mode outputs (§4.4) and on-board
+housekeeping (status LEDs, reset button, board-ID straps, IND1/IND2
+indicator drives). Slow-path signals reach the firmware via two
+I²C-attached MCP23017 expanders with ~80 µs round-trip latency per
+full poll, polled at 50 Hz by default and on-demand for console
+queries.
+
+Observation-only slow signals — major-state F/D/E, IR, link, break,
+interrupt-acknowledge, TPx, etc. — used to live on a separate pair
+of MCP23017 expanders (the original design's #0 and #1) but have
+been migrated to the §6.10 cycle-accurate trace chain, which samples
+them at full bus rate.
+
+The 24 bus-data signals (MD0..MD11 and DATA0..DATA11) share a single
+12-bit RP2350 port (`D0..D11`). The four 74AHC574 latches of §5
+(MD-IN, MD-OUT, DATA-IN, DATA-OUT) decouple the two physical buses
+from the shared port; memory cycles and IOT cycles are mutually
+exclusive in time so the multiplexing is loss-less. MD and DATA
+therefore appear in the table below only as the shared `D0..D11`
+entry, but they contribute 24 of the 96 active Omnibus signals counted
+in §3.11.
 
 | Group | Signals | Pins | Direction |
 |---|---|---|---|
 | Address | MA0..MA11 | 12 | RP2350 in (CPU's CPMA always drives MA — see §4.4) |
 | Extended address | EMA0..EMA2 | 3 | RP2350 in |
-| Shared 12-bit data port | D0..D11 | 12 | bidirectional, latched both ways |
-| Cycle qualifiers | MEM_START, IO_PAUSE, INTERNAL_IO | 3 | RP2350 in |
+| Shared 12-bit data port | D0..D11 (carries MD0..MD11 in memory cycles, DATA0..DATA11 in IOT cycles) | 12 | bidirectional, latched both ways |
+| Cycle qualifiers | MEM_START, IO_PAUSE | 2 | RP2350 in (INTERNAL_IO moved to trace chain — see §6.10; the firmware recognises internal IOTs from MD device-code 0..7) |
 | Memory write strobe | WRITE | 1 | RP2350 in |
-| Memory SOURCE | SOURCE | 1 | direction deferred — see §10 (likely RP2350 out, asserted when card is the addressed memory; pending verification) |
+| Memory SOURCE | SOURCE | 0 | routed via the trace chain (§6.10) on the assumption §10 resolves to RP2350-input-only; if §10 instead resolves to bidirectional, SOURCE returns to direct GPIO and one of the MCP23017 #3 housekeeping signals takes its trace-chain slot |
 | TS edges | TS1, TS3 | 2 | RP2350 in (TS2/TS4 derived in PIO) |
 | IOT data strobe | BUS_STROBE | 1 | RP2350 in |
 | Bus-direction control | MD_DIR | 1 | RP2350 out (to 74540 OE) |
@@ -329,21 +378,31 @@ edge".
 | Interrupt | INT_RQST | 1 | RP2350 out |
 | Console pulse-bank OE | OE_CONSOLE_PULSE | 1 | RP2350 out (gates the pulse half of the console-output 74540) |
 | SD card SPI | SD_MOSI, SD_MISO, SD_SCK, SD_CS | 4 | RP2350 in/out (see §7.6) |
+| Trace chain | TRACE_SCK, TRACE_SDI | 2 | RP2350 out + in — clocks and reads the 4× 74HC597 slow-signal chain (§6.10) |
 | **Subtotal** | | **46** | |
 
 ### 4.2 Slow / I²C MCP23017 port expanders
 
-64 GPIO pins are available across four MCP23017s on I²C0 at addresses
-0x20, 0x21, 0x22, 0x23. The same I²C bus carries up to four optional
-SC16IS740 single-channel UART chips (§7.4) at addresses 0x48..0x4B. Non-volatile config lives in an
-internal RP2350 flash partition (no separate EEPROM). The four expanders
-together cover all slow Omnibus signals, the bidirectional set-and-hold
-console outputs (§4.4), on-board housekeeping (status LEDs, reset
-button, board-ID straps), and approximately 16 free pins for additional
-slow signals.
+Two MCP23017s on I²C0 at addresses 0x22 and 0x23 cover the
+bidirectional console-mode outputs (§4.4) and on-board housekeeping
+(status LEDs, reset button, board-ID straps, indicator drives). The
+former observe-only expanders at 0x20/0x21 — which provided ~50 Hz
+visibility into major-state, IR, link, break, interrupt-acknowledge,
+TPx, and similar slow signals — have been removed: those 32 signals
+are now captured at full Omnibus rate by the §6.10 trace chain.
+Non-volatile config lives in an internal RP2350 flash partition (no
+separate EEPROM). The same I²C bus carries up to four optional
+SC16IS740 single-channel UART chips (§7.4) at addresses 0x48..0x4B.
 
-The bus is configured as I²C fast-mode-plus (1 MHz) so MCP23017 polling
-and MAX14830 byte transfers do not contend.
+The bus is configured as I²C fast-mode-plus (1 MHz) so MCP23017
+polling and SC16IS740 byte transfers do not contend. The 1 MHz figure
+is the **bus clock rate**, not a sampling rate: a full poll of both
+MCP23017s reads 4 bytes plus address/register overhead in ~80 µs.
+The firmware polls at 50 Hz by default (every 20 ms — fine for state
+display and console-status queries) and triggers an immediate poll on
+console commands like `status`. Cycle-rate observation of bus state
+no longer flows through this path — it is handled by the §6.10 trace
+chain.
 
 Several signals are **bidirectional**: they're observed when another module
 is driving the bus, and asserted by the card during console operations
@@ -353,11 +412,7 @@ output channel under software-controlled OE provides the assertion path.
 
 | MCP # | Pins | Signals | Notes |
 |---|---|---|---|
-| #0 (0x20) | A0..A7 | F, D, E, F_SET, IR00, IR01, IR2, USER_MODE | observe only |
-| #0 (0x20) | B0..B7 | RUN, NOT_LAST_TR, OVERFLOW, LINK, LINK_DATA, LINK_LOAD, ROM_ADDR, INHIBIT | observe only |
-| #1 (0x21) | A0..A7 | BREAK_CYCLE, BRK_IN_PROG, BRK_DATA, NTS_STALL, INT_IN_PROG, INT_STROBE, RETURN, POWER_OK | observe only |
-| #1 (0x21) | B0..B7 | TP1, TP2, TP3, TP4, IND1, IND2, SW, (1 spare) | TPx observe; IND1/2 drive |
-| #2 (0x22) | A0..A7 | KEY_CTL, STOP, LA_ENABLE, DF_ENABLE, MS_DISABLE, CPMA_DISABLE, (2 spare) | **bidirectional** — set-and-hold console outputs (see §4.4) |
+| #2 (0x22) | A0..A7 | KEY_CTL, STOP, LA_ENABLE, DF_ENABLE, MS_DISABLE, CPMA_DISABLE, IND1, IND2 | **bidirectional** — set-and-hold console outputs (see §4.4); IND1/IND2 are output-only indicator drives migrated from the removed MCP #1 |
 | #2 (0x22) | B0..B7 | OE_CONSOLE_HOLD, (7 spare) | OE for the set-and-hold half of the console-output 74540 bank |
 | #3 (0x23) | A0..A7 | STATUS_LED_0, STATUS_LED_1, STATUS_LED_2, BOARD_RESET_BTN, BOARD_ID_0..3 | on-board housekeeping; LEDs out, button + ID straps in |
 | #3 (0x23) | B0..B7 | (8 spare) | reserved for additional slow signals |
@@ -382,29 +437,38 @@ do not consume GPIO.
 
 | Use | Pins |
 |---|---|
-| I²C0 (SDA, SCL) — to 4× MCP23017 + optional SC16IS740 chips | 2 |
-| Direct fast-path Omnibus signals (§4.1) | 46 |
+| I²C0 (SDA, SCL) — to 2× MCP23017 + optional SC16IS740 chips | 2 |
+| Direct fast-path Omnibus signals (§4.1) | 44 |
+| Trace chain (§6.10) — TRACE_SCK out, TRACE_SDI in | 2 |
 | **Total** | **48** |
 
 The 4-pin SD-card SPI sub-budget (§7.6) is funded by **folding the three
 console pulse outputs** (`LOAD_CONT`, `PULSE_LA`, `INITIALIZE`) into the
 IOT response latch path (§4.4), reclaiming 3 GPIO; the net change vs.
-the no-SD design is +1 pin. Status LED and on-board housekeeping live on
-MCP23017 #3 (§4.2), which has ~16 spare pins for additional slow signals.
+the no-SD design is +1 pin.
 
-If pin pressure increases further (e.g., BREAK-cycle support per §6.9),
-a slow signal can be moved from MCP23017 #3 onto a freed RP2350 pin and
-a less-critical fast signal demoted to MCP23017 #3 — a firmware and
-routing change rather than a BOM change.
+The 2-pin trace-chain sub-budget (§6.10) is funded by demoting two
+signals out of the direct fast path: **INTERNAL_IO** (recoverable
+from MD device-code decoding — internal IOTs use device codes 0..7)
+and **SOURCE** (assuming §10 resolves to RP2350-input-only — if it
+resolves to bidirectional, SOURCE returns to direct GPIO and a
+spare position on MCP23017 #3 substitutes on the trace chain). Both
+demoted signals remain visible to the firmware, sampled by the trace
+chain on every cycle (§6.10) — the demotion does not lose
+information, only the ability to trigger PIO on their edges, which
+is not needed.
 
-If pin pressure increases later (e.g., adding BREAK-cycle support per
-§6.9), a slow signal can be moved from MCP23017 #3 onto a freed RP2350
-pin and a less-critical fast signal demoted to MCP23017 #3 — a firmware
-and routing change rather than a BOM change.
+Status LED and on-board housekeeping live on MCP23017 #3 (§4.2),
+which has ~16 spare pins for additional slow signals. If further pin
+pressure arises later (e.g., BREAK-cycle support per §6.9), a slow
+signal can be moved from MCP23017 #3 onto a freed RP2350 pin and a
+less-critical fast signal demoted to MCP23017 #3 or to a spare
+position on the trace chain — a firmware and routing change rather
+than a BOM change.
 
-The RP2350's HSTX block can alternatively absorb the shared D-port,
-freeing 12 GPIO and gaining considerable bandwidth on the data path.
-That option is noted but not used in this design.
+The RP2350's HSTX block can alternatively absorb the shared D-port
+output direction, freeing additional GPIO. That option is noted but
+not used in this design.
 
 ### 4.4 Console-mode bus drives
 
@@ -647,9 +711,12 @@ RP2350 has 3 PIO blocks × 4 SMs each = 12 SMs. The card uses:
 | PIO1.SM1 | IOT decode helper — captures MD-IN at IOT cycle TS1 into a FIFO |
 | PIO1.SM2 | DATA bus capture — samples DATA-IN at BUS_STROBE when sinking |
 | PIO2.SM0 | TS edge sequencer — exposes a 4-state phase counter via IRQ flags |
+| PIO2.SM1 | Trace shifter — clocks 32 bits out of the 74HC597 chain during TS2 of each cycle (§6.10) |
+| PIO2.SM2 | Trace fast-path snapshot — samples direct GPIOs on the same TS1 IRQ (§6.10) |
 
-Five SMs spare for future device emulations that need their own protocol
-state machines (e.g., a DMA-capable disk controller using BREAK cycles).
+Three SMs spare for future device emulations that need their own
+protocol state machines (e.g., a DMA-capable disk controller using
+BREAK cycles).
 
 ### 6.4 Memory READ cycle — sequence
 
@@ -753,13 +820,43 @@ operations queue work for the M33 to handle in the slack between IOTs.
 When an emulated device needs to interrupt:
 
 1. M33 firmware sets a flag.
-2. Background task asserts INT_RQST GPIO (open-drain via 74540 channel).
-3. CPU acknowledges via INT_IN_PROG (observed on MCP23017 #1).
+2. Background task asserts INT_RQST GPIO (open-drain emulation —
+   see below).
+3. CPU acknowledges via INT_IN_PROG (observed via the §6.10 trace
+   chain at full bus rate).
 4. CPU executes IOT to clear the device's interrupt flag.
 
 INT_RQST is on direct GPIO because deassertion is timing-coupled to the
 acknowledging IOT — the firmware deasserts it within the IOT cycle that
 acknowledges it, which would not be reliable at I²C latencies.
+
+**Why INT_IN_PROG and INT_STROBE are not on direct GPIO.** The card
+has exactly two cycle-deadline obligations around interrupts: assert
+`~INT_RQST` when its emulated device wants to interrupt, and deassert
+it during the IOT cycle in which the OS clears that device's flag
+(KCF, TCF, …). Both are handled on the fast path — `~INT_RQST`
+directly on GPIO, the IOT via the §6.6 dispatch path. INT_IN_PROG and
+INT_STROBE, in contrast, are CPU-internal signals announcing the
+interrupt-entry sequence ("PC → location 0, jump to location 1, clear
+ION") to the bus; the card has no edge-triggered action on them. They
+are captured by the §6.10 trace chain on every Omnibus cycle, which
+is enough for status display ("interrupt being serviced") and full
+trace reconstruction — what the card cannot do is fire a PIO state
+machine off their edges, which it does not need to. This matches the
+standard PDP-8 software model: interrupt dispatch is done by the OS
+via skip-on-flag IOTs, not by hardware-vectored response to
+INT_STROBE.
+
+**Open-drain emulation with a tri-state buffer.** ~INT_RQST is a
+wire-OR signal on the Omnibus: any card may pull it low, the bus
+terminator pulls it high, and an open-collector / open-drain driver is
+the canonical way to drive it. The 74540 is a tri-state (push-pull)
+buffer, not open-collector, so the firmware emulates open-drain
+behaviour by holding the corresponding 74540 input permanently at the
+asserting level and toggling only the channel's output enable: OE low
+drives the bus low, OE high goes to high-Z (the bus pull-up wins).
+The 74540 output never actively drives high, so no contention can
+occur with another card asserting ~INT_RQST in parallel.
 
 ### 6.8 Console-cycle timing
 
@@ -788,14 +885,203 @@ CPU is halted while the operation runs.
 ### 6.9 BREAK / DMA cycles
 
 The base firmware does not participate in BREAK cycles. The card observes
-BRK_IN_PROG and BREAK_CYCLE on the slow path (MCP23017 #1) and stays out
-of the way. A device emulation that needs BREAK participation (e.g., a
-disk controller doing three-cycle data break) extends the design by:
+BRK_IN_PROG and BREAK_CYCLE via the §6.10 trace chain at full bus rate
+and stays out of the way. A device emulation that needs BREAK
+participation (e.g., a disk controller doing three-cycle data break)
+extends the design by:
 
-* Promoting BRK_IN_PROG / BREAK_CYCLE to direct GPIO (a slow-signal
-  swap-out from MCP23017 #3 — see §4.3),
+* Promoting BRK_IN_PROG / BREAK_CYCLE to direct GPIO (swapped out
+  from a less-critical fast pin — see §4.3),
 * Using one of the spare PIO state machines for the BREAK protocol,
 * Driving MA/MD via the existing latches under BREAK timing rules.
+
+### 6.10 Cycle-accurate bus tracing
+
+To eliminate the slow-path observation gap (§4.2 was originally
+limited to ~50 Hz for major-state, IR, link, break, interrupt-
+acknowledge, and TPx signals), the card includes a high-speed shift-
+register chain that captures all 32 of those signals on every Omnibus
+cycle. Combined with the existing fast-path GPIO snapshot, this gives
+the card logic-analyser-grade visibility — any of the 96 active
+Omnibus signals is observable at every cycle, with no external
+instrument needed.
+
+#### 6.10.1 Hardware: 4× 74HC597 chain + 74HC273 pulse latch
+
+Four 74HC597 8-bit parallel-load shift registers are daisy-chained
+(QH of one feeds DS of the next) to give 32 captured bits per cycle.
+The 74HC597 is a *dual-stage* part — a parallel-loaded **storage
+register** clocked by RCK feeds an independently-clocked **shift
+register** clocked by SHCP. This decouples capture (must be
+synchronous to the bus) from readout (free-running PIO), and is the
+key reason for choosing 597 over the simpler single-stage 74HC165.
+
+Pulse and phase signals — TP1, TP2, TP3, TP4, INT_STROBE, LINK_LOAD,
+INHIBIT, RETURN — are short and asynchronous to a single end-of-cycle
+sample point. They feed a **74HC273 octal D-FF with asynchronous
+/CLR** that acts as an 8-bit pulse-latch bank: D inputs tied high,
+CLK input is the pulse signal itself, /CLR is a brief reset pulse
+generated by an RC differentiator off TS1-rising. Each Q goes high
+the moment its pulse rises and stays high until the next /CLR pulse
+clears it at the start of the following cycle. The 74HC597 storage
+register samples the Q outputs at the TS1-rising edge of each cycle
+— before the /CLR pulse fires — so any pulse that asserted during the
+preceding cycle is captured as Q=1 in that cycle's trace record.
+
+Inputs to the 597 chain (suggested mapping — bit positions are not
+firmware-visible; the firmware reads a 32-bit shift result and
+masks/shifts according to a constant):
+
+| 597 # | Inputs | Source | Group |
+|---|---|---|---|
+| #A | F, D, E, F_SET, IR00, IR01, IR2, USER_MODE | direct from 74244 | Major state + IR top bits — all level signals |
+| #B | LINK, LINK_DATA, OVERFLOW, RUN, NOT_LAST_TR, ROM_ADDR, INTERNAL_IO, SOURCE | direct from 74244 | CPU register state + demoted fast signals (§4.3) — all level signals |
+| #C | BREAK_CYCLE, BRK_IN_PROG, BRK_DATA, NTS_STALL, INT_IN_PROG, POWER_OK, SW, (1 spare) | direct from 74244 | Break / interrupt status — all level signals |
+| #D | **TP1, TP2, TP3, TP4, INT_STROBE, LINK_LOAD, INHIBIT, RETURN** | **74HC273 Q outputs** | Pulse and phase signals — latched by the 74HC273 |
+
+Inputs to the 74HC273 pulse-latch (8-bit):
+
+| 273 bit | Source | Why latched |
+|---|---|---|
+| Q0..Q3 | TP1..TP4 | ~100 ns pulses fired at fixed phase offsets within the cycle; would otherwise be missed by single-snapshot sampling |
+| Q4 | INT_STROBE | short pulse during interrupt entry |
+| Q5 | LINK_LOAD | short pulse when LINK is loaded by a CPU operation |
+| Q6 | INHIBIT | memory-cycle phase signal asserted during inhibit phase only — would have deasserted by sample time |
+| Q7 | RETURN | memory-cycle phase signal at end-of-cycle, similarly transient |
+
+The 74HC273's Q outputs are stable from the moment the pulse fires
+until the next /CLR — so the 597 storage register, sampling at the
+following cycle's TS1-rising, sees a consistent "did this signal
+assert during the previous cycle" indicator for every pulse signal.
+Fine pulse timing within a cycle is *not* recovered (the latch
+doesn't preserve when in the cycle the pulse fired), but for trace
+analysis the answer to "did TP3 fire on this cycle" is what's
+needed; pulse position within the cycle is fixed by the PDP-8/E
+timing model (§6.1).
+
+#### 6.10.2 Capture timing
+
+  * **74HC597 RCK** = buffered TS1 (positive-true). On TS1-rising,
+    each chip's storage register clocks in its 8 parallel inputs.
+    This sample point captures the *previous* cycle's accumulated
+    state — for level signals (#A, #B, #C) the value is whatever
+    was on the input at TS1-rising; for pulse signals (#D), the
+    74HC273's latched Q values reflect any pulse that fired during
+    the previous cycle.
+  * **74HC273 /CLR** = brief LOW pulse derived from TS1-rising via
+    an RC differentiator (1 kΩ + 100 pF ⇒ ~100 ns pulse), arranged
+    so the /CLR transition follows the 597 RCK transition by
+    ≥ 5 ns to satisfy the 597's setup/hold without race.
+    Implementation: a single 74AHC1G14 Schmitt-trigger inverter
+    cleans up the differentiated edge.
+  * **74HC597 /STR** = buffered TS1 inverted. On TS1-falling
+    (= start of TS2), /STR rises and copies the storage register
+    contents into the shift register; PIO can then begin shifting.
+  * **74HC597 SHCP** = TRACE_SCK from PIO2.SM1, clocked at
+    sysclk/2 = 75 MHz. 32 bits at 13.3 ns each = ~427 ns total —
+    completes within the TS2..TS4 window (1300 ns available).
+  * **74HC597 QH (last in chain)** → TRACE_SDI to RP2350.
+
+This timing means each trace record corresponds to the *just-
+finished* cycle: when cycle N's TS1 rises, we capture state from
+cycle N-1. The firmware accounts for this one-cycle offset by
+pairing the 597-shifted slow-signal record with the *previous*
+fast-path snapshot in the assembly path (§6.10.3).
+
+#### 6.10.3 PIO and DMA path
+
+Two PIO state machines on PIO2 (currently free) handle capture:
+
+| PIO.SM | Role |
+|---|---|
+| PIO2.SM1 | Trace shifter — clocks TRACE_SCK 32 times per cycle, reads QH of #A into ISR, pushes 32-bit slow-signal word into RX FIFO |
+| PIO2.SM2 | Fast-path snapshot — on the same TS1 IRQ, samples a configurable 32-bit slice of direct GPIOs (MA + EMA + cycle qualifiers + a few extras) and pushes into a parallel RX FIFO |
+
+A DMA channel pair joins the two 32-bit FIFO outputs into a single
+64-bit (8-byte) trace record and writes it into a circular ring
+buffer in SRAM. The ring sink is software-configurable.
+
+Per-cycle PIO time:
+
+* Snapshot trigger — TS1 rising edge, raised as IRQ by the §6.3
+  PIO2.SM0 phase counter. The 74HC597 storage register has already
+  captured by hardware (RCK = TS1).
+* PIO2.SM1 waits for the TS1-falling edge (start of TS2), then
+  begins shifting at sysclk/2 (= 75 MHz, 13.3 ns per bit) —
+  32 bits × 13.3 ns = ~427 ns to complete the shift. The 74HC597's
+  /STR has just risen on the same TS1-falling, copying the storage
+  register into the shift register so PIO sees stable data.
+* The shift completes well within TS2 (~500 ns), leaving TS3 and
+  TS4 idle on the trace path.
+* PIO2.SM2 takes the parallel fast-path snapshot of direct-GPIO
+  signals on the same TS1-rising IRQ in 1 PIO cycle and pushes
+  immediately.
+
+#### 6.10.4 Ring buffer + trigger
+
+The trace ring buffer's size and trigger mode are configurable from
+CDC0. Sensible defaults:
+
+| Mode | Behaviour |
+|---|---|
+| `ring` | Continuous capture into a 256 KB ring (32k × 8 B = ~50 ms at peak Omnibus rate). Always recording; oldest overwritten. |
+| `trigger <expr>` | Capture starts when `expr` matches. Pre/post-trigger split configurable. |
+| `match <expr>` | Capture only cycles where `expr` matches (sparse log). |
+| `single` | One-shot: capture until ring full, then stop. |
+
+Trigger expressions reference any captured signal by name — e.g.
+`MEM_START & MA == 07777`, `IO_PAUSE & device == 03`, `INT_RQST.rise`,
+`BRK_IN_PROG.fall`. Expression evaluation runs on the M33 in the
+gap between PIO interrupts.
+
+Console interface:
+
+```
+  > trace start [ring | trigger <expr> | match <expr> | single]
+  > trace stop
+  > trace dump [count] [text|binary]   — bulk readout via CDC0
+  > trace save <name>                  — flush ring to SD card (§7.6)
+  > trace clear
+```
+
+Bulk binary dump over CDC0 streams at full USB speed (~1 MB/s).
+A 256 KB ring takes ~256 ms to dump.
+
+#### 6.10.5 Halted-CPU behaviour
+
+TS1 does not fire when RUN is low, so the trace chain stops
+capturing new samples. This is acceptable because once the CPU
+halts, the slow signals it owns (F/D/E, IR, LINK, USER_MODE,
+NOT_LAST_TR, RUN itself, …) are static — the most-recent trace
+record from the last running cycle reflects the current bus state
+correctly. Console-status queries read the head of the trace ring
+buffer for those signals.
+
+The card-driven slow signals — set-and-hold console outputs and
+housekeeping LEDs (§4.2) — are independently visible to the firmware
+through the MCP23017 path; halt does not affect them.
+
+When the host issues a `run` or `step` command and the CPU resumes,
+TS1 fires again and the trace chain captures the resumed activity
+on the very first cycle.
+
+#### 6.10.6 Cost / I²C effect
+
+* **+4× 74HC597** @ ~$0.50 each = +$2.00 BOM.
+* **+1× 74HC273** octal D-FF (pulse-latch bank) ~$0.30.
+* **+1× 74AHC1G14** Schmitt-trigger inverter (cleans up the RC-
+  differentiated /CLR pulse) ~$0.12, plus an RC pair (1 kΩ + 100 pF)
+  in the passives kit.
+* **−2× MCP23017** @ $1.62 each = −$3.24 BOM (the two observe-only
+  expanders at 0x20/0x21 are deleted; their signals are now in the
+  trace chain).
+* **Net board cost**: −$0.82 vs. the pre-trace design.
+* **I²C bus loading**: 2× MCP23017 + up to 4× SC16IS740 = 6 devices,
+  leaving generous headroom for SC16IS740 byte transfers at sustained
+  RS-232 throughput.
+* **Firmware**: a few hundred lines for the PIO program, ring-buffer
+  manager, and CDC0 trace shell — small relative to the device-
+  emulation code.
 
 ## 7. USB Architecture
 
@@ -831,8 +1117,8 @@ Line-oriented ASCII protocol for human use; binary mode for tooling.
   run                            — release HALT
   halt                           — assert HALT (via STOP signal)
   step                           — single-step (via SS)
-  status                         — show CPU state from MCP23017 shadow
-  trace <on|off>                 — enable PIO event trace
+  status                         — show CPU state from latest §6.10 trace sample
+  trace <subcommand>             — control the cycle-accurate trace ring (§6.10)
   device list                    — list registered emulated devices
   reset                          — assert INITIALIZE on the bus
   ...
@@ -919,10 +1205,10 @@ external edge, or alternatively 2×5 IDC pin headers with off-board DB9
 pigtails. Headers save board area; DB9s save cabling. Both are footprint
 options on the PCB, populated as needed.
 
-**I²C bus loading**: 4 SC16IS740s + 4 MCP23017s = 8 devices on the bus.
+**I²C bus loading**: 4 SC16IS740s + 2 MCP23017s = 6 devices on the bus.
 At 1 MHz fast-mode-plus, byte transfer latency is ~24 µs. For the
 heaviest realistic load — 4 ports × 115.2 kbaud × ~12 kHz byte rate =
-48 kHz aggregate — the bus is < 30% utilised, leaving plenty of
+48 kHz aggregate — the bus is < 25% utilised, leaving plenty of
 headroom for MCP23017 polling.
 
 **Firmware integration**: each emulated serial peripheral (PT08, KL8E,
@@ -1023,33 +1309,38 @@ images, and disk-image storage for any disk-emulation devices. Saving a
 
 1. **Power and clock.** Verify 3.3 V regulation, USB enumeration, status
    LED toggle via MCP23017 #3.
-2. **I²C bus.** Verify all four MCP23017s respond at 0x20/0x21/0x22/0x23;
-   toggle IND1/IND2 LEDs from firmware.
-3. **Bus passive.** With all 74540 outputs disabled, plug the card into a
-   running PDP-8/E. The card should be transparent to the bus — read back
-   all slow signals via MCP23017 and confirm sensible values for RUN,
-   F/D/E, etc.
-4. **Address sampling.** Enable PIO0.SM1; verify MA + EMA captured
+2. **I²C bus.** Verify both MCP23017s respond at 0x22/0x23; toggle
+   IND1/IND2 LEDs from firmware (now on MCP23017 #2 spare positions).
+3. **Trace chain.** Plug the card into a running PDP-8/E with all
+   74540 outputs disabled. With the CPU running, start the §6.10
+   trace and verify the captured RUN, F/D/E, IR, LINK fields match
+   the actual program execution. Then halt the CPU and verify the
+   periodic-strobe fallback (§6.10.5) keeps the trace updated.
+4. **Bus passive.** With all 74540 outputs still disabled, confirm
+   the card is transparent to the bus — no contention, no spurious
+   edges.
+5. **Address sampling.** Enable PIO0.SM1; verify MA + EMA captured
    correctly for each instruction the running CPU executes (compare
-   against expected PC walk).
-5. **Memory READ emulation, single field.** Disable any other memory in
-   the slot; load a small program into RP2350 SRAM; enable the memory
-   READ path. CPU should fetch from the card.
-6. **Memory WRITE emulation.** Enable WRITE capture path; verify writes
-   land in the SRAM image.
-7. **Extended-memory cycles.** Run a CDF/CIF sequence; confirm EMA is
-   sampled per-cycle and addresses route to the correct field.
-8. **IOT decode.** Implement a single trivial IOT (e.g., one that just
-   returns SKIP); verify CPU behaviour.
-9. **Console CDC.** Bring up CDC0; implement examine/deposit; verify the
-   host can manipulate memory.
-10. **Console-mode bus drives.** Validate the §4.4 set-and-hold + pulse
-    paths with the CPU halted: assert KEY_CTL, set CPMA via SR-on-DATA +
-    LOAD_CONT, examine memory through forced cycles.
-11. **Serial CDC.** Bring up CDC1 with PT08 emulation; load FOCAL or
+   against expected PC walk; cross-check against trace output from
+   step 3).
+6. **Memory READ emulation, single field.** Disable any other memory
+   in the slot; load a small program into RP2350 SRAM; enable the
+   memory READ path. CPU should fetch from the card.
+7. **Memory WRITE emulation.** Enable WRITE capture path; verify
+   writes land in the SRAM image.
+8. **Extended-memory cycles.** Run a CDF/CIF sequence; confirm EMA
+   is sampled per-cycle and addresses route to the correct field.
+9. **IOT decode.** Implement a single trivial IOT (e.g., one that
+   just returns SKIP); verify CPU behaviour.
+10. **Console CDC.** Bring up CDC0; implement examine/deposit;
+    verify the host can manipulate memory.
+11. **Console-mode bus drives.** Validate the §4.4 set-and-hold +
+    pulse paths with the CPU halted: assert KEY_CTL, set CPMA via
+    SR-on-DATA + LOAD_CONT, examine memory through forced cycles.
+12. **Serial CDC.** Bring up CDC1 with PT08 emulation; load FOCAL or
     BASIC; verify a TTY session works.
-12. **Multi-CDC.** Add additional CDC ports.
-13. **Soak test.** Run a memory-stress program for hours; verify no
+13. **Multi-CDC.** Add additional CDC ports.
+14. **Soak test.** Run a memory-stress program for hours; verify no
     timing-related corruption.
 
 ## 10. Open Questions and Risks
@@ -1059,17 +1350,29 @@ images, and disk-image storage for any disk-emulation devices. Saving a
   from the MA path, the captured field could correspond to a different
   cycle than the captured address. Mitigation: route EMA through the same
   74244 bank as MA (or one with matched propagation delay), and verify
-  with a logic-analyser capture during bring-up step 4.
+  with a logic-analyser capture during bring-up step 5.
 * **Polarity correctness.** 74540 inverts; 74244 does not. The firmware
   must carry the polarity convention consistently. A polarity-inversion
   layer at the GPIO read/write boundary keeps the rest of the firmware in
   positive-true logic.
+* **AHC/AHCT edge speeds on the Omnibus backplane.** The AHC/AHCT
+  family has transition times of ~2 ns. The PDP-8/E backplane was
+  designed for the slower 74H/74S TTL drivers of its era (transition
+  times ~5–10 ns) and is not a controlled-impedance / terminated
+  transmission line. Fast-edged drivers on long unterminated traces
+  can ring and produce reflections that cause spurious edge detection
+  on neighbouring cards. Mitigation: provide footprints for 33–47 Ω
+  series resistors in every 74540 output channel that drives directly
+  to a card-edge contact, populated only if ringing is observed during
+  bring-up step 4. As a fall-back, the slower 74HC family (transition
+  times ~6 ns) is logic-compatible — a BOM swap, no schematic change.
 * **74540 OE timing for IOT response.** The IOT response 74540 must be
   enabled exactly between TP1 and TP4 of the IOT cycle. Combinational gate
   in front of OE driven by `IO_PAUSE & TS2_or_TS3` is straightforward.
-* **MCP23017 polling latency.** 4 chips × 16 bits each at 400 kHz I²C ≈
-  400 µs round-trip. Acceptable for the slow-signal use case but firmware
-  must avoid blocking on it on the main thread.
+* **MCP23017 polling latency.** 2 remaining chips × 16 bits each at
+  1 MHz fast-mode-plus I²C ≈ 80 µs round-trip. Acceptable for the
+  console set-and-hold and housekeeping use cases. Firmware must
+  avoid blocking on it on the main thread.
 * **Power sequencing.** RP2350 must come up before it tri-states its
   GPIOs — with reset asserted, the card outputs to the bus must be
   disabled. The 74540 OE pins are pulled high (disabled) by default; the
@@ -1108,10 +1411,10 @@ The physical pin numbers depend on PCB layout. The logical assignment is:
 | GP_TS3 | in | ~TS3 | |
 | GP_MEM_START | in | ~MEM_START | |
 | GP_IO_PAUSE | in | ~IO_PAUSE | |
-| GP_INTERNAL_IO | in | ~INTERNAL_IO | |
 | GP_BUS_STROBE | in | ~BUS_STROBE | |
 | GP_WRITE | in | WRITE | |
-| GP_SOURCE | TBD | SOURCE | direction deferred — see Open Questions §10 |
+| (no GP_INTERNAL_IO) | — | — | demoted to trace chain (§6.10); recovered from MD device-code decode |
+| (no GP_SOURCE) | — | — | demoted to trace chain (§6.10), pending §10 resolution to RP2350-input-only |
 | GP_LE_OUT | out | output-latch CK pulse, demuxed to MD-OUT or DATA-OUT by MEM_START vs IO_PAUSE | |
 | GP_OE_IN | out | input-latch tri-state OE, demuxed to MD-IN or DATA-IN by MEM_START vs IO_PAUSE | |
 | GP_LE_IOT_OUT | out | IOT/console-pulse latch enable (see §4.4) | |
@@ -1123,14 +1426,17 @@ The physical pin numbers depend on PCB layout. The logical assignment is:
 | GP_SD_MISO | in  | SD card SPI MISO | (§7.6) |
 | GP_SD_SCK  | out | SD card SPI clock | (§7.6) |
 | GP_SD_CS   | out | SD card SPI chip select | (§7.6) |
-| GP_I2C_SDA | bidir | I²C0 SDA | To 4× MCP23017 + optional SC16IS740 chips |
-| GP_I2C_SCL | out | I²C0 SCL | To 4× MCP23017 + optional SC16IS740 chips |
+| GP_TRACE_SCK | out | trace-chain shift clock | (§6.10) — drives SHCP of all four 74HC597s |
+| GP_TRACE_SDI | in  | trace-chain serial data | (§6.10) — reads QH of 74HC597 #A (last in chain) |
+| GP_I2C_SDA | bidir | I²C0 SDA | To 2× MCP23017 + optional SC16IS740 chips |
+| GP_I2C_SCL | out | I²C0 SCL | To 2× MCP23017 + optional SC16IS740 chips |
 
-Total: 48 used, 0 spare, of the 48 PGA2350 GPIO. Console pulse outputs
-(LOAD_CONT, PULSE_LA, INITIALIZE) are absorbed by the IOT-response
-latch (§4.4) and so do not consume direct GPIO. The status LED, board
-reset button, SD-card CD/WP, and any future status outputs live on the
-spare pins of MCP23017 #3 (see §4.2).
+Total: 48 used, 0 spare, of the 48 PGA2350 GPIO. Console pulse
+outputs (LOAD_CONT, PULSE_LA, INITIALIZE) are absorbed by the IOT-
+response latch (§4.4) and so do not consume direct GPIO. INTERNAL_IO
+and SOURCE are absorbed by the §6.10 trace chain. The status LED,
+board reset button, SD-card CD/WP, and any future status outputs
+live on the spare pins of MCP23017 #3 (see §4.2).
 
 ## 12. Appendix B — Firmware structure
 
@@ -1140,11 +1446,13 @@ spare pins of MCP23017 #3 (see §4.2).
       mem_cycle.pio       — PIO program for memory cycle FSM
       iot_cycle.pio       — PIO program for IOT cycle FSM
       ts_sequencer.pio    — PIO program for TS edge phase counter
+      trace_shifter.pio   — PIO program for the 74HC597 trace chain (§6.10)
     omnibus/
       bus.c bus.h         — bus driver (PIO + DMA glue, latch control)
       memory.c memory.h   — 32 KW memory image, ROM overlay
       ema.c ema.h         — extended memory address shadow
       iot.c iot.h         — IOT dispatch table + decode
+      trace.c trace.h     — trace ring buffer, trigger expressions, dump
     devices/
       pt08.c pt08.h       — PT08-style serial peripheral
       kl8e.c kl8e.h       — KL8E serial peripheral
@@ -1177,16 +1485,19 @@ sub-circuit (§7.4).
 | # | Part | Pkg | Qty | Unit USD | Ext USD | Notes |
 |---|---|---|---|---|---|---|
 | 1 | Pimoroni PGA2350 (RP2350B + 16 MB QSPI flash + USB-C) | Module | 1 | 9.95 | 9.95 | shop.pimoroni.com |
-| 2 | MCP23017-E/SO 16-bit I²C GPIO expander | SOIC-28 | 4 | 1.62 | 6.48 | DigiKey, ample stock |
+| 2 | MCP23017-E/SO 16-bit I²C GPIO expander | SOIC-28 | 2 | 1.62 | 3.24 | console set-and-hold + housekeeping (§4.2) |
 | 3 | SN74AHC574DW octal D-FF, tri-state | SOIC-20 | 5 | 0.54 | 2.70 | DigiKey |
 | 4 | SN74AHC244DWR octal tri-state buffer | SOIC-20 | 4 | 0.84 | 3.36 | replaces obsolete 74244N |
 | 5 | SN74AHCT540PWR octal inverting tri-state buffer | TSSOP-20 | 4 | 0.70 | 2.80 | replaces obsolete 74540N |
 | 6 | SN74AHC1G126DBVR single tri-state buffer (latch-OE demux) | SOT-23-5 | 1 | 0.12 | 0.12 | |
-| 7 | MIC5219-3.3YM5-TR 3.3 V / 500 mA LDO | SOT-23-5 | 1 | 1.19 | 1.19 | |
-| 8 | GCT USB4105-GF-A USB-C receptacle | SMD/TH | 1 | 0.80 | 0.80 | |
-| 9 | microSD card push-push socket (e.g. Hirose DM3D-SF) + USBLC-style ESD protection | SMD | 1 | ~1.50 | 1.50 | DigiKey |
-| 10 | Passives kit (~50× MLCC bypass, ~20× pull-ups, status LEDs, ESD diode array, etc.) | 0603 / SOT | 1 lot | — | ~5–8 | DigiKey |
-| **Mandatory subtotal** | | | | | **~35–38** | |
+| 7 | SN74HC597D 8-bit parallel-load shift register (dual-stage) | SOIC-16 | 4 | 0.50 | 2.00 | trace chain (§6.10) — daisy-chained, RCK = TS1, /STR = ~TS1 |
+| 8 | SN74HC273D octal D-FF with /CLR | SOIC-20 | 1 | 0.30 | 0.30 | pulse-latch bank for TPx, INT_STROBE, LINK_LOAD, INHIBIT, RETURN (§6.10) |
+| 9 | SN74AHC1G14DBVR Schmitt-trigger inverter (RC-differentiated /CLR drive) | SOT-23-5 | 1 | 0.12 | 0.12 | (§6.10) |
+| 10 | MIC5219-3.3YM5-TR 3.3 V / 500 mA LDO | SOT-23-5 | 1 | 1.19 | 1.19 | |
+| 11 | GCT USB4105-GF-A USB-C receptacle | SMD/TH | 1 | 0.80 | 0.80 | |
+| 12 | microSD card push-push socket (e.g. Hirose DM3D-SF) + USBLC-style ESD protection | SMD | 1 | ~1.50 | 1.50 | DigiKey |
+| 13 | Passives kit (~50× MLCC bypass, ~20× pull-ups, status LEDs, ESD diode array, RC for /CLR, etc.) | 0603 / SOT | 1 lot | — | ~5–8 | DigiKey |
+| **Mandatory subtotal** | | | | | **~33–36** | |
 
 ### Optional RS-232 sub-circuit (per-port modular, up to 4 ports)
 
@@ -1211,11 +1522,11 @@ sub-circuit (§7.4).
 
 | Configuration | Active digital + connectors + passives |
 |---|---|
-| **Memory + IOT + USB + SD** (mandatory population) | **≈ $37** |
-| **+ 1 RS-232 port** | **≈ $46** |
-| **+ 2 RS-232 ports** | **≈ $56** |
-| **+ 3 RS-232 ports** | **≈ $65** |
-| **+ 4 RS-232 ports** | **≈ $75** |
+| **Memory + IOT + USB + SD + cycle trace** (mandatory population) | **≈ $35** |
+| **+ 1 RS-232 port** | **≈ $44** |
+| **+ 2 RS-232 ports** | **≈ $54** |
+| **+ 3 RS-232 ports** | **≈ $63** |
+| **+ 4 RS-232 ports** | **≈ $73** |
 | Bare-chip RP2350B alternative (saves ~$8 vs PGA2350, but adds crystal, flash, USB ESD, decoupling — saving largely cancels out at prototype quantity) | comparable |
 
 ### Notes
@@ -1232,7 +1543,9 @@ sub-circuit (§7.4).
 
 ### Procurement summary
 
-Mandatory BOM is dominated by the PGA2350 module ($10), four MCP23017s
-($6.50), glue logic and 574 latches ($10), and passives — roughly $35
-in parts plus PCB fabrication. Each additional populated RS-232 port
-adds ~$9.25 (SC16IS740 + MAX3232 + DB9 + caps).
+Mandatory BOM is dominated by the PGA2350 module ($10), two MCP23017s
+($3.24), the 4× 74HC597 trace chain plus 74HC273 pulse-latch ($2.30),
+glue logic and 574 latches
+($10), and passives — roughly $33–36 in parts plus PCB fabrication.
+Each additional populated RS-232 port adds ~$9.25 (SC16IS740 +
+MAX3232 + DB9 + caps).
